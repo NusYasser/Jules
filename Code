@@ -1,0 +1,246 @@
+import os
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image
+import pytesseract
+import pandas as pd
+from tqdm import tqdm
+import re
+
+# --- CONFIGURATION ---
+
+# If Tesseract is not in your system's PATH, you need to set the command here.
+# For example, on Windows, it might be:
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# List of keywords to identify a designation line. Case-insensitive.
+# You can add more keywords here if you find common titles that are missed.
+DESIGNATION_KEYWORDS = [
+    'manager', 'director', 'lead', 'head', 'engineer', 'consultant', 'architect',
+    'specialist', 'vp', 'svp', 'ceo', 'cto', 'cfo', 'coo', 'owner', 'officer',
+    'analyst', 'advisor', 'administrator', 'strategy', 'developer', 'practice head',
+    'sme', 'product owner', 'services', 'solutions', 'technical program',
+    'founder', 'president', 'vice president', 'associate', 'executive', 'partner',
+    'principal', 'senior', 'junior', 'staff', 'marketing', 'sales', 'hr',
+    'human resources', 'finance', 'operations', 'project', 'program', 'talent',
+    'recruit', 'recruitment', 'account', 'client', 'customer', 'tech', 'software',
+    'hardware', 'research', 'development', 'salesforce', 'cloud', 'data', 'ai', 'ml'
+]
+
+# Optional: Add keywords that commonly appear in company names but rarely in designations.
+# This can help differentiate between a company and a second line of designation.
+COMPANY_INDICATORS = [
+    'inc.', 'llc', 'corp.', 'ltd.', 'group', 'solutions', 'technologies',
+    'systems', 'company', 'co.', 'industries', 'global', 'international',
+    'consulting', 'ventures', 'partners', 'associates', 'agency', 'institute',
+    'university', 'school', 'hospital', 'bank', 'capital', 'fund', 'advisory',
+    'media', 'digital', 'analytics', 'network', 'health', 'services', 'lab', 'labs',
+    'corp', 'limited', 'inc', 'llc', 'pte ltd', 'plc', 's.a.', 'gmbh', 'ag', 'pvt' # Added more common company suffixes
+]
+
+def clean_text(text):
+    """
+    Cleans the extracted text by removing unreadable characters and excessive whitespace.
+    Retains special characters that might be part of a name (e.g., hyphens, apostrophes).
+    """
+    # Allowed characters: letters, numbers, spaces, and common name/company special chars: .,&@#\'-
+    text = re.sub(r'[^a-zA-Z0-9\s.,&@#\'-]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip() # Replace multiple spaces with a single space
+    # Remove single characters that are not 'I' or 'A' and are not part of a word boundary
+    text = re.sub(r'\b(?![IA])\w\b', '', text).strip()
+    return text
+
+def select_paths():
+    """Opens GUI dialogs for user to select input and output paths."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main tkinter window
+
+    print("A dialog box will open to select the FOLDER with your screenshots.")
+    input_dir = filedialog.askdirectory(title="Select the Folder Containing Your Screenshots")
+    if not input_dir:
+        print("No input folder selected. Exiting.")
+        return None, None
+
+    print("A dialog box will open to select the SAVE LOCATION for the Excel file.")
+    output_path = filedialog.asksaveasfilename(
+        title="Save Excel File As...",
+        defaultextension=".xlsx",
+        filetypes=[("Excel Files", "*.xlsx"), ("All files", "*.*")]
+    )
+    if not output_path:
+        print("No output file selected. Exiting.")
+        return None, None
+        
+    return input_dir, output_path
+
+def is_designation(line):
+    """Checks if a line likely contains a job title."""
+    cleaned_line = line.lower()
+    return any(keyword in cleaned_line for keyword in DESIGNATION_KEYWORDS) and len(line) > 3
+
+def is_company_likely(line):
+    """Checks if a line likely contains a company name based on indicators and capitalization.
+       This function is primarily for identifying the company *after* a designation."""
+    cleaned_line = line.lower()
+    # Check for company specific keywords
+    if any(indicator in cleaned_line for indicator in COMPANY_INDICATORS):
+        return True
+    
+    # Heuristic: Check if line starts with a capital letter and has multiple capitalized words
+    # and doesn't look like a common short name (e.g., "John Doe")
+    words = line.split()
+    
+    # If the line is short (1-2 words) and looks like a typical capitalized name, it's probably not a company.
+    if len(words) <= 2 and all(word.istitle() for word in words if word and word.isalpha()):
+        return False
+        
+    # For longer lines or lines with different capitalization patterns, apply broader checks
+    if len(words) > 1 and (words[0].isupper() or words[0].istitle()): # Starts with Capital or Title
+        capitalized_words_count = sum(1 for word in words if word and (word[0].isupper() or word.istitle()))
+        # If a significant portion of words are capitalized and it's not a designation
+        if capitalized_words_count >= len(words) * 0.5 and not is_designation(line):
+            return True
+            
+    return False
+
+
+def parse_ocr_text(text):
+    """
+    Parses the raw text from OCR to extract structured records.
+    
+    Args:
+        text (str): The raw text output from pytesseract.
+        
+    Returns:
+        list: A list of tuples, where each tuple is (Name, Designation, Company).
+    """
+    records = []
+    lines = [clean_text(line) for line in text.split('\n') if clean_text(line)]
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        # Check if the current line looks like a designation
+        if is_designation(line):
+            name = ""
+            if i > 0:
+                potential_name = lines[i-1]
+                # A name should not be a designation.
+                # Crucially, it should also not contain explicit company indicators,
+                # but we avoid the broader `is_company_likely` here to prevent filtering out names.
+                if not is_designation(potential_name) and \
+                   not any(indicator in potential_name.lower() for indicator in COMPANY_INDICATORS):
+                    name = potential_name
+
+            designation = line.replace('>', '').strip() # Remove '>' character
+
+            company = ""
+            current_idx = i
+
+            # Look at the next line for a potential second part of designation or company
+            if current_idx + 1 < len(lines):
+                next_line = lines[current_idx + 1]
+
+                # Scenario 1: Next line is a second part of the designation
+                # Prioritize merging if it's a designation and does NOT strongly look like a company
+                if is_designation(next_line) and not is_company_likely(next_line):
+                    designation = f"{designation} {clean_text(next_line).replace('>', '').strip()}"
+                    current_idx += 1 # Move to the merged designation's last line
+
+                    # Now, the company should be on the line after the two-part designation
+                    if current_idx + 1 < len(lines): # Check if there's a line after the merged designation
+                        potential_company = lines[current_idx + 1]
+                        # Take as company if it's likely a company or simply not a designation
+                        if is_company_likely(potential_company) or not is_designation(potential_company):
+                            company = clean_text(potential_company)
+                    records.append((name, designation, company))
+                    i = current_idx + 2 # Advance past Name, Desg1, Desg2, Company (if found) or Name, Desg1, Desg2
+                    continue
+                
+                # Scenario 2: Next line is the company (standard case)
+                # This catches cases where next_line is a company or just general text that isn't a designation
+                elif is_company_likely(next_line) or not is_designation(next_line):
+                    company = clean_text(next_line)
+                    records.append((name, designation, company))
+                    i = current_idx + 2 # Advance past Name, Desg, Company
+                    continue
+            
+            # Scenario 3: Designation found, but no clear next line for company or two-part designation
+            # This handles cases where designation is the last line or company is missing/unidentifiable
+            records.append((name, designation, "")) # No company found
+            i = current_idx + 1 # Advance past Name, Desg
+            continue
+        
+        # If no record was found for the current line (not a designation), just move to the next line.
+        i += 1
+            
+    return records
+
+
+def main():
+    """Main function to run the entire process."""
+    print("--- Screenshot to Excel Extractor ---")
+    
+    input_dir, output_path = select_paths()
+    if not input_dir or not output_path:
+        return
+
+    print(f"\n[INFO] Input folder: {input_dir}")
+    print(f"[INFO] Output file: {output_path}\n")
+
+    # Get a list of all supported image files in the directory
+    image_files = [
+        f for f in os.listdir(input_dir) 
+        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp'))
+    ]
+
+    if not image_files:
+        print("[ERROR] No image files found in the selected directory. Exiting.")
+        return
+
+    all_data = []
+    
+    print(f"[INFO] Found {len(image_files)} images to process. This may take a while...")
+
+    # Process each image file with a progress bar
+    for filename in tqdm(image_files, desc="Processing Images"):
+        try:
+            image_path = os.path.join(input_dir, filename)
+            
+            # Use pytesseract to do OCR on the image
+            raw_text = pytesseract.image_to_string(Image.open(image_path))
+            
+            # Parse the extracted text to find records
+            records = parse_ocr_text(raw_text)
+            
+            if records:
+                all_data.extend(records)
+        except Exception as e:
+            print(f"\n[WARNING] Could not process file '{filename}'. Error: {e}")
+
+    if not all_data:
+        print("\n[ERROR] No data could be extracted. The output file will not be created.")
+        print("Please check if Tesseract is installed correctly and if the images are clear.")
+        return
+        
+    print(f"\n[INFO] Successfully extracted {len(all_data)} records.")
+    
+    # Create a pandas DataFrame
+    df = pd.DataFrame(all_data, columns=["Name", "Designation", "Company"])
+    
+    # Remove any potential duplicates that might arise from overlapping screenshots
+    df.drop_duplicates(inplace=True)
+    
+    print(f"[INFO] After removing duplicates, {len(df)} unique records remain.")
+
+    # Save the DataFrame to an Excel file
+    try:
+        df.to_excel(output_path, index=False)
+        print(f"\n[SUCCESS] All data has been saved to: {output_path}")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to save Excel file. Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
