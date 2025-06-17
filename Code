@@ -81,33 +81,217 @@ def is_designation(line):
     return any(keyword in cleaned_line for keyword in DESIGNATION_KEYWORDS) and len(line) > 3
 
 def is_company_likely(line):
-    """Checks if a line likely contains a company name based on indicators and capitalization.
-       This function is primarily for identifying the company *after* a designation."""
-    cleaned_line = line.lower()
-    # Check for company specific keywords
-    if any(indicator in cleaned_line for indicator in COMPANY_INDICATORS):
-        return True
-    
-    # Heuristic: Check if line starts with a capital letter and has multiple capitalized words
-    # and doesn't look like a common short name (e.g., "John Doe")
-    words = line.split()
-    
-    # If the line is short (1-2 words) and looks like a typical capitalized name, it's probably not a company.
-    if len(words) <= 2 and all(word.istitle() for word in words if word and word.isalpha()):
+    if not line:
         return False
-        
-    # For longer lines or lines with different capitalization patterns, apply broader checks
-    if len(words) > 1 and (words[0].isupper() or words[0].istitle()): # Starts with Capital or Title
-        capitalized_words_count = sum(1 for word in words if word and (word[0].isupper() or word.istitle()))
-        # If a significant portion of words are capitalized and it's not a designation
-        if capitalized_words_count >= len(words) * 0.5 and not is_designation(line):
+
+    # clean_text should have been applied to 'line' before this function is called.
+    # However, for safety, using .lower() internally.
+    cleaned_line_lower = line.lower()
+
+    # 1. Strong positive signal: explicit company indicators.
+    # This checks for suffixes like Inc., Ltd., LLC, Corp. or keywords like Solutions, Group within the line.
+    # It's important that these indicators are treated as whole words or parts of compound names.
+    for indicator_idx, indicator_val in enumerate(COMPANY_INDICATORS):
+        # Check if indicator is present as a whole word or at the start/end of the line.
+        # Regex might be better here, but for now, string matching:
+        # Pad with spaces to match whole words, or check start/end.
+        padded_indicator = f" {indicator_val} "
+        if f" {indicator_val}" == cleaned_line_lower[-len(f" {indicator_val}"):] or            indicator_val == cleaned_line_lower or            cleaned_line_lower.startswith(f"{indicator_val} ") or            padded_indicator in cleaned_line_lower:
+
+            # If the line itself is "Services" or "Solutions" and these are also designation keywords for roles like "Head of Services"
+            # this can be ambiguous.
+            # However, if "XYZ Services Inc." then "Inc." makes it clearly a company.
+            # If "Services" is a COMPANY_INDICATOR and also in DESIGNATION_KEYWORDS, is_designation might also be true.
+            # This clause gives priority to strong company indicators.
+            # Example: "Innovative Solutions Ltd." -> True
+            # Example: "Director of Solutions" -> is_designation would be true. is_company_likely might be true due to "Solutions".
+            # The calling function (parse_ocr_text) will need to handle ambiguity.
+            # For now, if a strong company indicator is well-placed, lean towards True.
+            # Let's refine to prioritize more definitive indicators first (Inc, LLC, Ltd, Corp, Group)
+            definitive_indicators = ['inc.', 'llc', 'corp.', 'ltd.', 'group', 'inc', 'llc', 'corp', 'ltd', 'gmbh', 'ag', 's.a.', 'pte', 'plc', 'limited']
+            is_definitive = any(definitive_ind.lower() == indicator_val.lower() for definitive_ind in definitive_indicators)
+
+            if is_definitive:
+                return True
+            # For more generic indicators like 'solutions', 'services', 'technologies', 'systems', 'global', 'consulting'
+            # be more cautious if the line is also a strong designation.
+            if is_designation(line): # if it's also "Head of Global Solutions"
+                 # if a generic indicator makes it "company like" but it's also a designation,
+                 # it's less clearly a standalone company unless other heuristics apply.
+                 # Let the next checks handle it. Don't return True immediately for generic ones if also desg.
+                 pass # Fall through to other checks
+            else:
+                return True # Generic indicator, not a designation -> likely company
+
+    # 2. Strong negative signal: If it looks like a person's name and lacks other company characteristics.
+    #    This uses the is_likely_name_pattern function (added in a previous step).
+    if is_likely_name_pattern(line):
+        # If it's a name pattern (e.g. "John Smith") AND not also a strong designation (e.g. "Chief Executive Officer"),
+        # then it's unlikely to be a company.
+        if not is_designation(line):
+            return False
+        # If it IS a name pattern AND ALSO a designation (e.g. "Senior Manager"), we still consider it NOT a company here.
+        # Company names are generally not also common designation titles.
+        return False
+
+
+    # 3. Heuristic: Capitalization and structure (if not a clear name pattern and no strong indicators found yet)
+    words = line.split()
+    if not words: return False
+
+    # If line is very short (1 word) and that word is a common designation keyword, it's not a company.
+    if len(words) == 1 and is_designation(line):
+        return False
+    
+    # General heuristic: multiple words, significant capitalization, not a designation.
+    if len(words) >= 1: # Allow single-word company names if they are proper nouns / brands
+        # Check if it starts with a capital letter (common for company names)
+        # or if any word is all caps (e.g. IBM, SAP)
+        first_word_is_capital_or_digit = words[0] and (words[0][0].isupper() or words[0][0].isdigit())
+        any_word_all_caps = any(word.isupper() and len(word) > 1 and word.isalpha() for word in words) # e.g. IBM, NASA (not 'A')
+
+        if first_word_is_capital_or_digit or any_word_all_caps:
+            capitalized_words_count = sum(1 for word in words if word and word[0].isupper())
+
+            # If a good portion of words are capitalized, or it contains ALL CAPS acronyms
+            # and it's not primarily a designation.
+            if (capitalized_words_count >= len(words) * 0.4 or any_word_all_caps) and not is_designation(line):
+                # Further check: Does it contain common business-related nouns or is it an acronym based company?
+                # This helps confirm if a generally capitalized phrase is indeed company-like.
+                common_business_nouns = ['solutions', 'systems', 'technologies', 'group', 'global', 'international',
+                                         'consulting', 'ventures', 'partners', 'associates', 'agency', 'industries',
+                                         'media', 'digital', 'analytics', 'network', 'capital', 'fund', 'advisory',
+                                         'bank', 'data', 'cloud', 'inc', 'corp', 'llc', 'ltd', 'co', 'tech']
+                # Check if any part of the line contains these nouns, helps for "Acme Tech Group"
+                if any(noun in cleaned_line_lower for noun in common_business_nouns) or any_word_all_caps:
+                    return True
+                # If just "General Marketing Department" (capitalized, not desg) but no strong business nouns/acronyms,
+                # it's ambiguous. Let's be a bit more conservative here.
+                # If more than 1 word and high capitalization ratio, it's still a good sign.
+                if len(words) > 1 and capitalized_words_count >= len(words) * 0.5:
+                    return True
+                # Single word, capitalized, not desg, not name, not indicator (e.g. "Google", "Apple")
+                if len(words) == 1 and capitalized_words_count == 1 and not is_likely_name_pattern(line) and not is_designation(line) and cleaned_line_lower not in DESIGNATION_KEYWORDS:
+                    # Check if it's not a common English word that happens to be capitalized.
+                    # This is hard without a dictionary. Assume proper nouns might be companies.
+                    if len(line) > 3: # Avoid "The", "And" etc. if somehow missed by other checks
+                        return True
+
+
+    # Default to False
+    return False
+
+
+# Helper function to check for name-like patterns
+def is_likely_name_pattern(line_text):
+    if not line_text:
+        return False
+    words = line_text.split()
+    # Common name patterns: 1-4 words, mostly title-cased or all caps (for initials)
+    if 1 <= len(words) <= 4:
+        title_case_words = 0
+        all_caps_words = 0
+        other_case_words = 0 # for counting lowercase words that are not particles
+        name_particles = ['van', 'von', 'de', 'la', 'du', 'el']
+
+        for word_idx, word_val in enumerate(words):
+            word_lower = word_val.lower()
+            # Check for non-alphanumeric characters not allowed in names (e.g. numbers, most symbols)
+            # Allow hyphens, apostrophes. Allow periods only if they are part of initials (e.g. J.R.)
+            cleaned_word = ''.join(char for char in word_val if char.isalnum() or char in "'-")
+            if not cleaned_word and word_val != '.': # Handle case of only non-alphanum chars
+                 if not (len(word_val) == 1 and word_val == '.' and word_idx > 0 and len(words[word_idx-1])==1 and words[word_idx-1].isupper()): # allow A. Smith
+                    return False # Contains invalid characters or structure for a name component
+
+            if word_val.istitle():
+                title_case_words += 1
+            elif word_val.isupper() and len(word_val) <= 3: # Allow initials like J.R.R. or single cap like 'A'
+                all_caps_words += 1
+            elif word_lower in name_particles:
+                pass
+            elif word_val.islower():
+                other_case_words += 1
+            elif not any(char.isalpha() for char in word_val): # If not alpha and not particle/initial/title (e.g. numbers only)
+                return False
+
+
+        # If too many lowercase words that aren't particles, less likely a name.
+        if other_case_words > 1 or (other_case_words == 1 and len(words) > 1 and words[0].islower() and words[0].lower() not in name_particles):
+            return False
+
+        # Heuristic: if a good portion of words are title case or all_caps (initials)
+        if title_case_words >= 1 and (title_case_words + all_caps_words >= len(words) * 0.5):
+            # Avoid flagging single common title-cased words that might be part of a designation or company
+            # These lists are assumed to be globally available (DESIGNATION_KEYWORDS, COMPANY_INDICATORS)
+            if len(words) == 1 and line_text.lower() in DESIGNATION_KEYWORDS + COMPANY_INDICATORS + ['and', 'of', 'for', 'the', 'with', 'global', 'group', 'systems', 'services', 'solutions', 'technology']:
+                return False
+            return True
+    return False
+
+# New helper function for designation continuation
+def is_plausible_designation_continuation(line_text, prev_line_had_strong_desg_keywords):
+    if not line_text:
+        return False
+
+    cleaned_line_lower = line_text.lower() # clean_text already applied to lines in parse_ocr_text
+
+    # 1. Rule out if it's very clearly a company (using a refined is_company_likely check if needed)
+    #    For now, use existing is_company_likely. If it's company AND NOT also a designation, then rule out.
+    if is_company_likely(line_text) and not is_designation(line_text): # is_designation checks DESIGNATION_KEYWORDS
+        return False
+
+    # 2. Rule out if it looks like a person's full name and not also a designation
+    if is_likely_name_pattern(line_text) and not is_designation(line_text):
+        return False
+
+    # 3. Check for positive signs of continuation
+    words = line_text.split()
+    if not words: # Should not happen if line_text is not empty
+        return False
+
+    # Common words that might start or be part of a second line of a title
+    common_continuation_starters_and_parts = [
+        'and', 'of', 'for', 'with', 'in', 'on', '(', '&', # starters
+        'systems', 'services', 'solutions', 'strategy', 'operations', 'management',
+        'development', 'delivery', 'relations', 'special', 'projects', 'technology',
+        'consulting', 'analytics', 'data', 'cloud', 'digital', 'global', 'regional',
+        'enterprise', 'customer', 'product', 'program', 'project', 'quality',
+        'engineering', 'architecture', 'design', 'innovation', 'research', 'technologies',
+        'information', 'resources', 'officer', 'executive', 'specialist', 'lead', 'head' # some overlap with DESIGNATION_KEYWORDS is fine
+    ]
+
+    # If the previous line had strong designation keywords, be more inclusive for the continuation.
+    if prev_line_had_strong_desg_keywords:
+        # Starts with a common joining word or a lowercase word (suggesting continuation)
+        if words[0].lower() in common_continuation_starters_and_parts[:7] or words[0].islower():
+            return True
+        # Contains common keywords found in longer titles
+        if any(keyword in cleaned_line_lower for keyword in common_continuation_starters_and_parts):
+            return True
+        # If the line is relatively short (1-3 words) and doesn't scream company/name, it's plausible.
+        # This is for cases like "Head of Sales" / "North America" where "North America" is Desg2
+        if len(words) <= 3 and not is_company_likely(line_text) and not is_likely_name_pattern(line_text):
+            # Further check: ensure it's not just a random capitalized word unless it's a known region/dept.
+            # This needs careful thought to avoid being too greedy.
+            # For now, this condition is broad.
             return True
             
+    # 4. General check: if it contains known DESIGNATION_KEYWORDS and is not primarily a company/name
+    if is_designation(line_text):
+        if not is_company_likely(line_text) and not is_likely_name_pattern(line_text):
+            return True
+
+    # If the line is short and just consists of '&' or '(' often it's a continuation
+    if line_text.strip() in ['&', '(']:
+        return True
+
     return False
 
 
 def parse_ocr_text(text):
     records = []
+    # Assumes clean_text, is_designation, is_company_likely,
+    # is_plausible_designation_continuation, is_likely_name_pattern are defined globally.
     lines = [clean_text(line) for line in text.split('\n') if clean_text(line)]
 
     idx = 0
@@ -115,62 +299,102 @@ def parse_ocr_text(text):
         current_line_text = lines[idx]
         
         name = ""
-        designation_parts = []
+        final_designation = ""
         company = ""
-        
-        # Step 1: Check if current line is a designation
+
+        # Default advancement: move to the next line if no record is made or this line isn't processed as Desg1
+        idx_to_advance_to = idx + 1
+
+        # A valid record block must start with a designation.
         if is_designation(current_line_text):
-            # Potential designation found.
-            # Step 1a: Try to get a name from the previous line.
+            # Potential Desg1 found.
+            # Attempt to get a valid name from the previous line.
             if idx > 0:
                 potential_name_line = lines[idx-1]
-                # A name should not be a designation or a company indicator.
-                if not is_designation(potential_name_line) and                    not any(indicator in potential_name_line.lower() for indicator in COMPANY_INDICATORS):
-                    name = potential_name_line
+                # A name should not itself be a designation, a company, or a stray designation part.
+                if not is_designation(potential_name_line) and                    not is_company_likely(potential_name_line) and                    not is_plausible_designation_continuation(potential_name_line, False):
+                    # If it looks like a name pattern, it's a good candidate.
+                    # If not a name pattern, it might still be a name if it's simple text.
+                    name = potential_name_line # Accept if it passes the negative checks
 
-            if not name: # Rule: If no valid name before designation, skip.
-                idx += 1
+            if not name:
+                # If no valid name is found before Desg1, this isn't the start of a usable record.
+                # Advance idx by 1 and continue to the next line.
+                idx = idx_to_advance_to
                 continue
 
-            # Current line is the first part of the designation
-            designation_parts.append(current_line_text.replace('>', '').strip())
+            # We have a Name and Desg1
+            desg1 = current_line_text.replace('>', '').strip()
 
-            # Index used to track lines consumed for the current potential record
-            # Starts at the first line of designation
-            current_record_last_line_idx = idx
+            # Prepare indices for looking at Line2 (potential Desg2 or Company)
+            # and Line3 (potential Company if Line2 was Desg2)
+            line2_idx = idx + 1
+            line3_idx = idx + 2
 
-            # Step 1b: Check if the next line is a second part of the designation.
-            if current_record_last_line_idx + 1 < len(lines):
-                next_line_text = lines[current_record_last_line_idx + 1]
-                # If next line is a designation AND not likely a company, it's part 2 of designation.
-                if is_designation(next_line_text) and not is_company_likely(next_line_text):
-                    designation_parts.append(next_line_text.replace('>', '').strip())
-                    current_record_last_line_idx += 1 # Advance to the second designation line
+            line2_is_desg2 = False # Flag to track if Line2 is treated as Desg2
 
-                    # Step 1c: Company should be after the two-line designation.
-                    if current_record_last_line_idx + 1 < len(lines):
-                        potential_company_line = lines[current_record_last_line_idx + 1]
-                        # Take as company if it's likely a company OR simply not another designation.
-                        if is_company_likely(potential_company_line) or not is_designation(potential_company_line):
-                            company = clean_text(potential_company_line)
-                            current_record_last_line_idx += 1 # Advance to company line
-                # Else (next line is not a second designation part), check if it's a company (for single-line designation)
-                elif is_company_likely(next_line_text) or not is_designation(next_line_text):
-                    company = clean_text(next_line_text)
-                    current_record_last_line_idx += 1 # Advance to company line
+            # Check if Line2 can be Desg2
+            if line2_idx < len(lines):
+                line2_text = lines[line2_idx]
+                # Condition 1 for Desg2: Is it a plausible continuation?
+                # Condition 2 for Desg2: It should NOT be primarily a company.
+                if is_plausible_designation_continuation(line2_text, True) and                    not is_company_likely(line2_text):
+                    # Condition 3 for Desg2: Avoid using a line as Desg2 if it's likely the next person's name.
+                    # This happens if line2_text looks like a name AND line3_text (the line after line2_text) is a designation.
+                    is_line2_likely_next_name = False
+                    if is_likely_name_pattern(line2_text):
+                        if line3_idx < len(lines) and is_designation(lines[line3_idx]):
+                            is_line2_likely_next_name = True
 
-            final_designation = " ".join(designation_parts)
+                    if not is_line2_likely_next_name:
+                        line2_is_desg2 = True
 
-            # Rule: Only add record if Name, Designation, AND Company are all present and non-empty.
+            if line2_is_desg2:
+                # Scenario: Name, Desg1, Desg2 ... try for Company on Line3
+                desg2_text = lines[line2_idx].replace('>', '').strip()
+                final_designation = f"{desg1} {desg2_text}"
+
+                idx_to_advance_to = line2_idx + 1 # Default advance past Desg2
+
+                if line3_idx < len(lines):
+                    company_candidate_line = lines[line3_idx]
+                    # Lookahead check for name-as-company:
+                    # If company_candidate_line looks like a name, AND line after it is a designation,
+                    # then company_candidate_line is likely the next person's name, not the company.
+                    is_candidate_next_persons_name = False
+                    if is_likely_name_pattern(company_candidate_line):
+                        if (line3_idx + 1) < len(lines) and is_designation(lines[line3_idx+1]):
+                            is_candidate_next_persons_name = True
+
+                    if not is_candidate_next_persons_name and is_company_likely(company_candidate_line):
+                        company = clean_text(company_candidate_line)
+                        idx_to_advance_to = line3_idx + 1 # Advance past company if found
+            else:
+                # Scenario: Name, Desg1 ... try for Company on Line2
+                final_designation = desg1
+                idx_to_advance_to = idx + 1 # Default advance past Desg1
+
+                if line2_idx < len(lines):
+                    company_candidate_line = lines[line2_idx]
+                    is_candidate_next_persons_name = False
+                    if is_likely_name_pattern(company_candidate_line):
+                        if (line2_idx + 1) < len(lines) and is_designation(lines[line2_idx+1]):
+                             is_candidate_next_persons_name = True
+
+                    if not is_candidate_next_persons_name and is_company_likely(company_candidate_line):
+                         company = clean_text(company_candidate_line)
+                         idx_to_advance_to = line2_idx + 1 # Advance past company if found
+
+            # Add record only if all three parts (Name, Designation, Company) are successfully populated.
             if name and final_designation and company:
                 records.append((name, final_designation, company))
 
-            # Advance main loop counter 'idx' to the line AFTER all consumed parts of the current record attempt.
-            idx = current_record_last_line_idx + 1
-            continue # Continue to next iteration of the while loop with the new idx
+            idx = idx_to_advance_to # Set main loop index to advance correctly
+            continue # Restart loop with the new idx to find the next record
 
-        # If current line is not a designation, simply advance
-        idx += 1
+        # If current_line_text was not a designation (or if name check failed earlier for a designation block)
+        # just advance idx by 1.
+        idx = idx_to_advance_to
             
     return records
 
