@@ -74,7 +74,7 @@ def main():
         # Ensure correct column order, though parse_text creates dicts with these keys
         df = df[['name', 'designation', 'company']]
 
-        output_filename = "output.xlsx"
+        output_filename = "output_4_line_only.xlsx"
         try:
             df.to_excel(output_filename, index=False)
             print(f"\nSuccessfully saved {len(all_records)} record(s) to {output_filename}.")
